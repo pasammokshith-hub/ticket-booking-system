@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Concurrent Ticket Booking (Seat Locking) — Demo</title>
+<style>
+  :root{
+    --seat-size:48px;
+    --gap:8px;
+    --accent:#2563eb;
+    --danger:#dc2626;
+    --ok:#059669;
+    --muted:#94a3b8;
+  }
+  body{
+    font-family: Inter, system-ui, Arial;
+    margin:0;
+    padding:20px;
+    background:linear-gradient(180deg,#f8fafc,#eef2ff);
+    color:#0f172a;
+  }
+  header{display:flex;justify-content:space-between;align-items:center;gap:12px}
+  h1{font-size:18px;margin:0}
+  .top-right{display:flex;gap:8px;align-items:center}
+  input[type="text"]{padding:6px 8px;border-radius:6px;border:1px solid #cbd5e1}
+  button{padding:8px 10px;border-radius:8px;border:0;background:var(--accent);color:white;cursor:pointer}
+  button.ghost{background:transparent;color:var(--accent);border:1px solid rgba(37,99,235,0.12)}
+  .controls{display:flex;gap:8px;align-items:center;margin-top:12px}
+  .status{margin-left:8px;color:var(--muted);font-size:13px}
+  .grid{display:grid;grid-template-columns:repeat(8, var(--seat-size));gap:var(--gap);margin-top:18px;justify-content:start}
+  .seat{
+    width:var(--seat-size);
+    height:var(--seat-size);
+    border-radius:8px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    user-select:none;
+    font-weight:600;
+    cursor:pointer;
+    transition:transform .12s;
+    box-shadow:0 6px 14px rgba(2,6,23,0.06), inset 0 -2px 0 rgba(255,255,255,0.04);
+  }
+  .seat:active{transform:translateY(2px)}
+  .seat.available{background:white;color:#0f172a;border:1px solid #e6eef8}
+  .seat.locked-other{background:#fff7ed;color:#92400e;border:1px solid #f6e3c8;cursor:not-allowed;opacity:0.95}
+  .seat.locked-me{background:#eef2ff;color:var(--accent);border:1px solid #cfe0ff}
+  .seat.booked{background:var(--muted);color:white;opacity:0.95;cursor:not-allowed}
+  .legend{display:flex;gap:10px;margin-top:14px;align-items:center}
+  .legend .item{display:flex;gap:6px;align-items:center;font-size:13px}
+  .sw{width:14px;height:14px;border-radius:4px;display:inline-block}
+  footer{margin-top:18px;color:var(--muted);font-size:13px}
+  .actions{display:flex;gap:8px;margin-top:12px}
+  .small{font-size:13px;padding:6px 8px;border-radius:8px}
+  .danger{background:var(--danger)}
+  .ok{background:var(--ok)}
+  .muted{background:#e2e8f0;color:#0f172a}
+  .note{margin-top:12px;color:#334155;font-size:13px}
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>🎟️ Concurrent Ticket Booking — Seat Lock Demo</h1>
+    <div class="status">Open this page in multiple tabs, set different usernames and try locking/booking the same seats.</div>
+  </div>
+
+  <div class="top-right">
+    <label for="username">User:</label>
+    <input id="username" type="text" placeholder="Your name" />
+    <button id="setUserBtn" class="ghost">Set</button>
+  </div>
+</header>
+
+<div class="controls">
+  <div>Seats: <strong id="totalSeats">0</strong></div>
+  <div style="margin-left:10px">Locked by you: <strong id="yourLocks">0</strong></div>
+  <div style="margin-left:10px">Booked: <strong id="bookedCount">0</strong></div>
+  <div class="status" id="clock"> </div>
+</div>
+
+<div class="actions">
+  <button id="autoLockBtn" class="small ghost">Auto-lock 3 random seats</button>
+  <button id="confirmBtn" class="small ok">Confirm Booking (lock → book)</button>
+  <button id="releaseBtn" class="small danger">Release My Locks</button>
+  <button id="resetBtn" class="small muted">Reset All (DEV)</button>
+</div>
+
+<div class="legend">
+  <div class="item"><span class="sw" style="background:white;border:1px solid #e6eef8"></span> Available</div>
+  <div class="item"><span class="sw" style="background:#eef2ff;border:1px solid #cfe0ff"></span> Locked (you)</div>
+  <div class="item"><span class="sw" style="background:#fff7ed;border:1px solid #f6e3c8"></span> Locked (other)</div>
+  <div class="item"><span class="sw" style="background:var(--muted)"></span> Booked</div>
+</div>
+
+<div id="gridContainer">
+  <div class="grid" id="seatGrid"></div>
+</div>
+
+<footer>
+  <div class="note">
+    Lock timeout: <strong id="lockTimeoutLabel">25s</strong>. Locks auto-expire. This demo uses <code>localStorage</code> to share state between tabs.
+  </div>
+</footer>
+
+<script>
+/*
+  Concurrent Seat Locking Demo (Frontend only)
+  - Shared state stored under localStorage key "SEAT_STATE_v1"
+  - Structure: {
+      version:1,
+      seats: { "A1": {status:"available"|"locked"|"booked", owner:"name", lockExpires:timestamp} , ... }
+      epoch: <Date.now()> // bump to detect changes
+    }
+  - Each client uses a 'clientId' + username.
+  - Atomic update pattern: read -> updater(copy) -> write with retry if epoch changed.
+*/
+
+const STATE_KEY = "SEAT_STATE_v1";
+const ROWS = 6;
+const COLS = 8;
+const LOCK_TIMEOUT_MS = 25000; // 25 seconds
+const MAX_RETRIES = 6;
+const CLEAN_INTERVAL = 2000; // 2s
+const CLOCK_INTERVAL = 1000;
+
+const seatGrid = document.getElementById("seatGrid");
+const totalSeatsEl = document.getElementById("totalSeats");
+const yourLocksEl = document.getElementById("yourLocks");
+const bookedCountEl = document.getElementById("bookedCount");
+const usernameInput = document.getElementById("username");
+const setUserBtn = document.getElementById("setUserBtn");
+const confirmBtn = document.getElementById("confirmBtn");
+const releaseBtn = document.getElementById("releaseBtn");
+const resetBtn = document.getElementById("resetBtn");
+const autoLockBtn = document.getElementById("autoLockBtn");
+const clockEl = document.getElementById("clock");
+const lockTimeoutLabel = document.getElementById("lockTimeoutLabel");
+
+lockTimeoutLabel.textContent = (LOCK_TIMEOUT_MS/1000) + "s";
+
+let clientId = generateId();
+let username = "";
+let localState = null; // cached copy
+
+// Helper: seat names A1..F8
+function seatName(r,c){ return String.fromCharCode(65+r) + (c+1); }
+
+// Initialize default state if not present
+function makeInitialState(){
+  const seats = {};
+  for(let r=0;r<ROWS;r++){
+    for(let c=0;c<COLS;c++){
+      seats[seatName(r,c)] = { status:"available", owner:null, lockExpires: null };
+    }
+  }
+  return { version:1, seats, epoch: Date.now() };
+}
+
+function readState(){
+  const raw = localStorage.getItem(STATE_KEY);
+  if(!raw) return makeInitialState();
+  try{
+    const parsed = JSON.parse(raw);
+    // defensive: sanitize expired locks
+    return parsed;
+  }catch(e){
+    console.warn("corrupt state, resetting");
+    return makeInitialState();
+  }
+}
+
+function writeState(state){
+  state.epoch = Date.now();
+  localStorage.setItem(STATE_KEY, JSON.stringify(state));
+}
+
+// Atomic-ish updater: read -> updater(copy) -> write if epoch same, retry
+function updateState(updater){
+  for(let attempt=0; attempt<MAX_RETRIES; attempt++){
+    const beforeRaw = localStorage.getItem(STATE_KEY);
+    const before = beforeRaw ? JSON.parse(beforeRaw) : makeInitialState();
+    const copy = deepCopy(before);
+    updater(copy);
+    // cleanup expired locks before writing to reduce conflicts
+    cleanExpiredLocks(copy);
+    // compare epoch
+    const afterRaw = localStorage.getItem(STATE_KEY);
+    const afterEpoch = afterRaw ? JSON.parse(afterRaw).epoch : null;
+    if(afterEpoch === before.epoch){
+      // safe to write
+      writeState(copy);
+      localState = copy;
+      return true;
+    }else{
+      // somebody changed state, retry
+      continue;
+    }
+  }
+  return false;
+}
+
+function deepCopy(obj){ return JSON.parse(JSON.stringify(obj)); }
+
+// Remove locks that have expired (mutates state)
+function cleanExpiredLocks(state){
+  const now = Date.now();
+  for(const [k,v] of Object.entries(state.seats)){
+    if(v.status === "locked" && v.lockExpires && v.lockExpires <= now){
+      state.seats[k] = { status:"available", owner:null, lockExpires:null };
+    }
+  }
+}
+
+// UI: render seats based on local copy
+function render(){
+  const state = readState();
+  cleanExpiredLocks(state);
+  // keep cached localState in sync
+  localState = state;
+  seatGrid.innerHTML = "";
+  let bookedCount = 0;
+  let yourLocks = 0;
+  Object.keys(state.seats).forEach((s)=>{
+    const seat = state.seats[s];
+    const div = document.createElement("div");
+    div.className = "seat";
+    div.textContent = s;
+    if(seat.status === "available"){
+      div.classList.add("available");
+      div.title = "Available — click to lock";
+      div.onclick = ()=> tryLockSeat(s);
+    }else if(seat.status === "locked"){
+      if(seat.owner === username && username !== ""){
+        div.classList.add("locked-me");
+        div.title = `Locked by you — expires ${timeRemainingStr(seat.lockExpires)}`;
+        yourLocks++;
+        div.onclick = ()=> { /* maybe unlock or keep */ tryUnlockSeat(s); };
+      }else{
+        div.classList.add("locked-other");
+        div.title = `Locked by ${seat.owner || "someone"} — expires ${timeRemainingStr(seat.lockExpires)}`;
+        div.onclick = ()=> alert("This seat is locked by another user.");
+      }
+    }else if(seat.status === "booked"){
+      div.classList.add("booked");
+      div.title = `Booked by ${seat.owner}`;
+      bookedCount++;
+      div.onclick = ()=> alert("This seat is already booked.");
+    }
+    seatGrid.appendChild(div);
+  });
+  totalSeatsEl.textContent = Object.keys(state.seats).length;
+  yourLocksEl.textContent = yourLocks;
+  bookedCountEl.textContent = bookedCount;
+}
+
+// Time remaining string
+function timeRemainingStr(ts){
+  if(!ts) return "—";
+  const sec = Math.max(0, Math.floor((ts - Date.now())/1000));
+  return sec + "s";
+}
+
+// Try to lock seat (owner becomes username)
+function tryLockSeat(seatId){
+  if(!username){ alert("Set your username first (top-right) to lock seats."); return; }
+  const success = updateState((st)=>{
+    const seat = st.seats[seatId];
+    // refresh expired locks
+    if(seat.status === "available" || (seat.status==="locked" && seat.lockExpires && seat.lockExpires <= Date.now())){
+      st.seats[seatId] = { status:"locked", owner:username, lockExpires: Date.now() + LOCK_TIMEOUT_MS };
+    } else {
+      // cannot lock; leave unchanged
+    }
+  });
+  if(!success) { alert("Couldn't lock seat due to concurrent update — try again"); }
+  render();
+}
+
+// Try unlock if owned by you
+function tryUnlockSeat(seatId){
+  if(!username) return;
+  const success = updateState((st)=>{
+    const seat = st.seats[seatId];
+    if(seat.status === "locked" && seat.owner === username){
+      st.seats[seatId] = { status:"available", owner:null, lockExpires:null };
+    }
+  });
+  if(!success) alert("Couldn't unlock — try again");
+  render();
+}
+
+// Confirm booking: convert all your locked seats to booked
+function confirmBooking(){
+  if(!username){ alert("Set username first."); return; }
+  let hadLocks = false;
+  const success = updateState((st)=>{
+    for(const [k,v] of Object.entries(st.seats)){
+      if(v.status === "locked" && v.owner === username){
+        v.status = "booked";
+        v.lockExpires = null;
+        // owner remains username
+        hadLocks = true;
+      }
+    }
+  });
+  if(!success){ alert("Failed to book due to concurrent change — try again"); return; }
+  if(!hadLocks) { alert("You have no locks to confirm."); }
+  render();
+}
+
+// Release all locks owned by you
+function releaseMyLocks(){
+  if(!username) { alert("Set username first."); return; }
+  const success = updateState((st)=>{
+    for(const [k,v] of Object.entries(st.seats)){
+      if(v.status === "locked" && v.owner === username){
+        st.seats[k] = { status:"available", owner:null, lockExpires:null };
+      }
+    }
+  });
+  if(!success) alert("Failed to release locks — try again");
+  render();
+}
+
+// Auto-lock N random available seats
+function autoLockRandom(n=3){
+  if(!username){ alert("Set username first."); return; }
+  for(let i=0;i<3;i++){
+    // attempt to lock one seat at a time (could be batched too)
+    updateState((st)=>{
+      const avail = Object.entries(st.seats).filter(([k,v]) => v.status === "available");
+      if(avail.length===0) return;
+      const choice = avail[Math.floor(Math.random()*avail.length)][0];
+      st.seats[choice] = { status:"locked", owner:username, lockExpires: Date.now() + LOCK_TIMEOUT_MS };
+    });
+  }
+  render();
+}
+
+// Reset state (DEV)
+function resetState(){
+  if(!confirm("Reset all seats to available & clear bookings? (DEV)")) return;
+  localStorage.removeItem(STATE_KEY);
+  writeState(makeInitialState());
+  render();
+}
+
+// Handle storage events (other tabs modified state)
+window.addEventListener("storage", (ev)=>{
+  if(ev.key === STATE_KEY){
+    render();
+  }
+});
+
+// Periodic cleanup of expired locks from local copy and write back (so expired locks get cleared globally)
+function periodicCleanup(){
+  // attempt to clean expired locks and write if changes found
+  updateState((st)=>{
+    const before = JSON.stringify(st);
+    cleanExpiredLocks(st);
+    // if expired locks cleaned, the writeState will happen because updater always writes when epoch unchanged
+  });
+  render();
+}
+
+// Utility: generate unique client id
+function generateId(){ return 'c_'+Math.random().toString(36).slice(2,9); }
+
+// On set username
+setUserBtn.onclick = ()=>{
+  const val = usernameInput.value.trim();
+  if(!val){ alert("Enter a non-empty username"); return; }
+  username = val;
+  localStorage.setItem(clientId + "_username", username);
+  render();
+  alert("Username set to: " + username + ". Open another tab and set a different name to simulate concurrency.");
+};
+
+// Attach button actions
+confirmBtn.onclick = confirmBooking;
+releaseBtn.onclick = releaseMyLocks;
+resetBtn.onclick = resetState;
+autoLockBtn.onclick = ()=> autoLockRandom(3);
+
+// keyboard enter to set name
+usernameInput.addEventListener("keyup", (e)=> { if(e.key === "Enter") setUserBtn.click(); });
+
+// show clock/time and update lock timers display every second
+setInterval(()=> {
+  const now = new Date();
+  clockEl.textContent = now.toLocaleTimeString();
+  // update small timers in title attributes by re-rendering (cheap)
+  render();
+}, CLOCK_INTERVAL);
+
+// periodic cleanup interval
+setInterval(periodicCleanup, CLEAN_INTERVAL);
+
+// Initialize storage if missing
+if(!localStorage.getItem(STATE_KEY)) writeState(makeInitialState());
+
+// initial render
+render();
+
+// Make state accessible for debugging
+window.SEAT_STATE_KEY = STATE_KEY;
+window.getState = ()=> readState();
+
+</script>
+
+</body>
+</html>
